@@ -13,12 +13,14 @@ from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env
 from mjlab.tasks.tracking.mdp.commands import MotionCommand
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
+from supermimic.envs.motion_command import configure_motion_command
 from supermimic.representations import (
   PROPRIO_NOISE_HALF_WIDTHS,
   assemble_anchor_window,
   motion_anchor_window,
   motion_goal_window,
 )
+from supermimic.tasks.p2 import P2_FOOT_GEOMS, make_p2_robot
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
@@ -197,6 +199,29 @@ def gencoord_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   cfg.terminations.pop("ee_body_pos", None)
 
+  configure_motion_command(cfg)
+
+  return cfg
+
+
+def p2_env_cfg(play: bool = False, maxcoord: bool = False) -> ManagerBasedRlEnvCfg:
+  """P2 with the same observation/WM contracts as the corresponding G1 task."""
+  cfg = maxcoord_env_cfg(play) if maxcoord else gencoord_env_cfg(play)
+  robot, scale = make_p2_robot()
+  cfg.scene.entities["robot"] = robot
+  cfg.actions["joint_pos"].scale = scale
+  motion = cfg.commands["motion"]
+  motion.anchor_body_name = "pelvis"
+  motion.body_names = tuple(
+    "waist_roll_link" if b == "torso_link" else b for b in motion.body_names
+  )
+  cfg.events["foot_friction"].params["asset_cfg"].geom_names = P2_FOOT_GEOMS
+  cfg.events["base_com"].params["asset_cfg"].body_names = ("waist_roll_link",)
+  cfg.viewer.body_name = "pelvis"
+  cfg.sim.mujoco.timestep = 0.005
+  cfg.decimation = 4
+  cfg.sim.nconmax = 128
+  cfg.sim.njmax = 768
   return cfg
 
 
