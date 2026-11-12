@@ -2,12 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main, master]
     paths-ignore:
       - '**.md'
       - 'LICENSE'
   pull_request:
-    branches: [master]
+    branches: [main, master]
     paths-ignore:
       - '**.md'
       - 'LICENSE'
@@ -44,9 +44,11 @@ jobs:
       - name: Checkout mjlab
         uses: actions/checkout@v4
         with:
-          repository: HybridRobotics/mjlab_research
-          token: ${{ secrets.MJLAB_PAT }}
+          repository: mujocolab/mjlab
+          ref: 08090e8a77228e733373f3b5c54f8b5a68d19d9d
           path: mjlab_research
+      - name: Apply public mjlab compatibility patch
+        run: git -C ../mjlab_research apply ../supermimic/patches/mjlab-public.patch
       - name: Setup uv
         uses: astral-sh/setup-uv@v6
         with:

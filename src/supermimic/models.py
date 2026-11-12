@@ -7,6 +7,8 @@ import torch.nn as nn
 from rsl_rl.modules import EmpiricalNormalization
 from tensordict import TensorDict
 
+from supermimic.quantization import LatentBottleneck
+
 if TYPE_CHECKING:
   from supermimic.representations import StateRepresentation
   from supermimic.tasks.task_spec import TaskSpec
@@ -128,6 +130,7 @@ class MultiEncoderAE(nn.Module):
     hidden_dims: tuple[int, ...],
     latent_bc_weight: float,
     history_length: int,
+    fsq: bool = False,
   ):
     super().__init__()
     if not task_specs:
@@ -135,6 +138,7 @@ class MultiEncoderAE(nn.Module):
     self.obs_dim = obs_dim
     self.history_length = history_length
     self.latent_dim = latent_dim
+    self.bottleneck = LatentBottleneck(fsq)
     self.latent_bc_weight = latent_bc_weight
     self.task_specs = task_specs
     self._task_names = [ts.name for ts in task_specs]
@@ -196,7 +200,7 @@ class MultiEncoderAE(nn.Module):
 
     self._aux_loss = self._compute_aux_loss(obs_td, slots)
 
-    z = torch.cat([torch.tanh(eo) for eo in enc_outs], dim=0)
+    z = torch.cat([self.bottleneck(eo) for eo in enc_outs], dim=0)
     history_n = self.obs_normalizer(obs_td["history"])
     return self.decoder(torch.cat([z, history_n.flatten(start_dim=1)], dim=-1))
 
@@ -222,9 +226,9 @@ class MultiEncoderAE(nn.Module):
       if name == anchor or lo == hi:
         continue
       goal_n_d = self.goal_normalizers[name](obs_td[f"goal_{name}"][lo:hi]).detach()
-      z = torch.tanh(self.encoders[name](goal_n_d))
+      z = self.bottleneck(self.encoders[name](goal_n_d))
       with torch.no_grad():
-        z_anchor = torch.tanh(self.encoders[anchor](anchor_goal_d[lo:hi]))
+        z_anchor = self.bottleneck(self.encoders[anchor](anchor_goal_d[lo:hi]))
       out[lo:hi] = self.latent_bc_weight * ((z - z_anchor) ** 2).mean(dim=-1)
     return out
 

@@ -28,6 +28,7 @@ from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from supermimic.representations import StateRepresentation, create_representation
 from supermimic.runners.exporter import export_actor_as_onnx
 from supermimic.runners.reset_sampling import ReturnSampler, ReturnSamplerCfg
+from supermimic.runners.sgs_sampling import SGSCfg
 from supermimic.sim_context import SimContext
 from supermimic.tasks.task_spec import (
   TasksCfg,
@@ -72,6 +73,8 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   max_iterations: int = 1000000
   replay_ratio: int = 16
   latent_dim: int = 32
+  fsq: bool = False
+  """Use the reproduced 40-dimensional, nine-level FSQ policy bottleneck."""
   actor_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 256)
   critic_hidden_dims: tuple[int, ...] = (256, 128)
   latent_bc_weight: float = 1e-1
@@ -85,12 +88,16 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   """Fractional slot allocation per task. Must sum to 1.0."""
   policy: BpttCfg | ActorCriticCfg = field(default_factory=ActorCriticCfg)
 
-  sampling_mode: Literal["uniform", "adaptive", "start", "return"] = "return"
+  sampling_mode: Literal["uniform", "adaptive", "start", "return", "sgs"] = "return"
   """RSI reset distribution: 'return' (concentrate resets on the bins where the
-  policy earns low return; see ReturnSampler) or one of mjlab's native modes.
+  policy earns low return; see ReturnSampler), 'sgs' (episode success), or
+  one of mjlab's native modes.
   train.py resolves this into the motion command's cfg before the env is built
-  ('return' drives mjlab's 'external' mode)."""
+  ('return' and 'sgs' drive the motion command's 'external' mode)."""
   return_sampler: ReturnSamplerCfg = field(default_factory=ReturnSamplerCfg)
+  sgs: SGSCfg = field(default_factory=SGSCfg)
+  sgs_state_path: str | None = None
+  """Optional saved sampler state. This restores sampling history, not optimizers."""
 
 
 @dataclass
@@ -191,10 +198,11 @@ def build_actor(
     action_dim=wm.num_actions,
     task_specs=resolve_task_specs(cfg.tasks, representation, wm.num_goals, device),
     slot_mix=cfg.slot_mix,
-    latent_dim=cfg.latent_dim,
+    latent_dim=40 if cfg.fsq else cfg.latent_dim,
     hidden_dims=cfg.actor_hidden_dims,
     latent_bc_weight=cfg.latent_bc_weight,
     history_length=cfg.history_length,
+    fsq=cfg.fsq,
   ).to(device)
 
 
@@ -575,7 +583,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     self._sampler: ReturnSampler | None = None
     env_mode = self.motion_cmd.cfg.sampling_mode
     expected = (
-      "external" if self.cfg.sampling_mode == "return" else self.cfg.sampling_mode
+      "external"
+      if self.cfg.sampling_mode in ("return", "sgs")
+      else self.cfg.sampling_mode
     )
     if env_mode != expected:
       raise RuntimeError(
@@ -584,6 +594,15 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         "into the env cfg before env creation ('external' also needs an mjlab with "
         "MotionCommand external-mode support)"
       )
+    if self.cfg.sampling_mode == "sgs":
+      if self.motion_cmd.sgs_sampler is None:
+        raise RuntimeError("SGS must be configured before building the environment")
+      if self.cfg.sgs_state_path:
+        self.motion_cmd.load_sgs_state_dict(
+          torch.load(
+            self.cfg.sgs_state_path, map_location=self.device, weights_only=True
+          )
+        )
     if self.cfg.sampling_mode != "return":
       return
     self._sampler = ReturnSampler(
@@ -701,6 +720,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         loss_dict.update(policy_logs)
 
       if step % self.cfg.log_interval == 0:
+        if self.cfg.sampling_mode == "sgs":
+          loss_dict.update(self.motion_cmd.sgs_logs())
         elapsed_time = time.time() - start_time
         total_train_time = wm_learn_time + policy_learn_time
         collect_time = elapsed_time - total_train_time
@@ -731,6 +752,10 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         torch.save(self._wm.bundle(), world_model_path)
         torch.save(self.policy_learner.actor.state_dict(), actor_path)
         checkpoint_files = [world_model_path, actor_path]
+        if self.cfg.sampling_mode == "sgs":
+          sampler_path = str(log_dir / "sgs.pt")
+          torch.save(self.motion_cmd.sgs_state_dict(), sampler_path)
+          checkpoint_files.append(sampler_path)
         critic = getattr(self.policy_learner, "critic", None)
         if critic is not None:
           critic_path = str(log_dir / "critic.pt")

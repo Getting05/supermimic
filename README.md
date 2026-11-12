@@ -16,9 +16,12 @@ Clone both repos as siblings:
 
 ```bash
 mkdir supermimic_ws && cd supermimic_ws
-git clone git@github.com:HybridRobotics/supermimic.git
-git clone git@github.com:HybridRobotics/mjlab_research.git
+git clone git@github.com:Getting05/supermimic.git
+git clone https://github.com/mujocolab/mjlab.git mjlab_research
+git -C mjlab_research checkout 08090e8a77228e733373f3b5c54f8b5a68d19d9d
+git -C mjlab_research apply ../supermimic/patches/mjlab-public.patch
 cd supermimic
+uv sync
 ```
 
 ## Usage
@@ -27,6 +30,13 @@ Available task IDs:
 
 - `SuperMimic-GenCoord-G1` — generalized coordinates representation
 - `SuperMimic-MaxCoord-G1` — maximal coordinates representation
+- `SuperMimic-GenCoord-P2` — Astro P2 generalized coordinates
+- `SuperMimic-MaxCoord-P2` — Astro P2 maximal coordinates
+
+The public mjlab patch above is the docker150 compatibility baseline. An existing
+patched checkout can be reused; do not apply the patch twice. P2 assets are bundled.
+See [P2, FSQ and SGS](docs/P2_FSQ_SGS.md) for motion conversion, independent feature
+switches and validation commands.
 
 Train a world model and policy:
 
