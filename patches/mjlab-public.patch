@@ -1,0 +1,450 @@
+diff --git a/src/mjlab/tasks/tracking/mdp/commands.py b/src/mjlab/tasks/tracking/mdp/commands.py
+index bc74418..17a6e1e 100644
+--- a/src/mjlab/tasks/tracking/mdp/commands.py
++++ b/src/mjlab/tasks/tracking/mdp/commands.py
+@@ -58,6 +58,17 @@ class MotionLoader:
+     self.body_lin_vel_w = self._body_lin_vel_w[:, self._body_indexes]
+     self.body_ang_vel_w = self._body_ang_vel_w[:, self._body_indexes]
+     self.time_step_total = self.joint_pos.shape[0]
++    self.motion_ends = torch.tensor([self.time_step_total], dtype=torch.long, device=device)
++    self.root_pos_w = self._body_pos_w[:, 0]
++    self.root_quat_w = self._body_quat_w[:, 0]
++
++  def body_state(self, frame_idxs: torch.Tensor):
++    return (
++      self.body_pos_w[frame_idxs],
++      self.body_quat_w[frame_idxs],
++      self.body_lin_vel_w[frame_idxs],
++      self.body_ang_vel_w[frame_idxs],
++    )
+ 
+ 
+ class MotionCommand(CommandTerm):
+@@ -81,6 +92,8 @@ class MotionCommand(CommandTerm):
+     self.motion = MotionLoader(
+       self.cfg.motion_file, self.body_indexes, device=self.device
+     )
++    from mjlab.utils.forward_kinematics import ForwardKinematics
++    self.motion.fk = ForwardKinematics(env.sim.mj_model, self.body_indexes, self.device)
+     self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+     self.body_pos_relative_w = torch.zeros(
+       self.num_envs, len(cfg.body_names), 3, device=self.device
+@@ -91,6 +104,7 @@ class MotionCommand(CommandTerm):
+     self.body_quat_relative_w[:, :, 0] = 1.0
+ 
+     self.bin_count = int(self.motion.time_step_total // (1 / env.step_dt)) + 1
++    self._external_sampling_weights = torch.ones(self.bin_count, device=self.device)
+     self.bin_failed_count = torch.zeros(
+       self.bin_count, dtype=torch.float, device=self.device
+     )
+@@ -316,11 +330,34 @@ class MotionCommand(CommandTerm):
+     self.robot.write_root_state_to_sim(root_state, env_ids=env_ids)
+     self.robot.reset(env_ids=env_ids)
+ 
++  def set_sampling_distribution(self, weights: torch.Tensor) -> None:
++    if weights.numel() != self.bin_count:
++      raise ValueError(f"Expected {self.bin_count} sampling bins, got {weights.numel()}")
++    self._external_sampling_weights = weights.detach().to(self.device).float().clamp_min(0)
++    if not torch.any(self._external_sampling_weights > 0):
++      self._external_sampling_weights.fill_(1)
++
++  def _external_sampling(self, env_ids: torch.Tensor) -> None:
++    if env_ids.numel() == 0:
++      return
++    bins = torch.multinomial(
++      self._external_sampling_weights, len(env_ids), replacement=True
++    )
++    steps_per_bin = int(round(1 / self._env.step_dt))
++    offsets = torch.randint(
++      0, steps_per_bin, (len(env_ids),), device=self.device
++    )
++    self.time_steps[env_ids] = (
++      bins * steps_per_bin + offsets
++    ).clamp(max=self.motion.time_step_total - 1)
++
+   def _resample_command(self, env_ids: torch.Tensor):
+     if self.cfg.sampling_mode == "start":
+       self.time_steps[env_ids] = 0
+     elif self.cfg.sampling_mode == "uniform":
+       self._uniform_sampling(env_ids)
++    elif self.cfg.sampling_mode == "external":
++      self._external_sampling(env_ids)
+     else:
+       assert self.cfg.sampling_mode == "adaptive"
+       self._adaptive_sampling(env_ids)
+@@ -595,7 +632,7 @@ class MotionCommandCfg(CommandTermCfg):
+   adaptive_lambda: float = 0.8
+   adaptive_uniform_ratio: float = 0.1
+   adaptive_alpha: float = 0.001
+-  sampling_mode: Literal["adaptive", "uniform", "start"] = "adaptive"
++  sampling_mode: Literal["adaptive", "uniform", "start", "external"] = "adaptive"
+ 
+   @dataclass
+   class VizCfg:
+diff --git a/src/mjlab/tasks/tracking/tracking_env_cfg.py b/src/mjlab/tasks/tracking/tracking_env_cfg.py
+index 53275ef..5ed32d4 100644
+--- a/src/mjlab/tasks/tracking/tracking_env_cfg.py
++++ b/src/mjlab/tasks/tracking/tracking_env_cfg.py
+@@ -37,6 +37,12 @@ VELOCITY_RANGE = {
+ }
+ 
+ 
++def _motion_end(env) -> "torch.Tensor":
++  """Terminate a reference episode at the last frame of its current motion."""
++  cmd = env.command_manager.get_term("motion")
++  return cmd.time_steps >= cmd.motion.time_step_total - 1
++
++
+ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
+   """Create base tracking task configuration."""
+ 
+@@ -256,6 +262,7 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
+ 
+   terminations: dict[str, TerminationTermCfg] = {
+     "time_out": TerminationTermCfg(func=mdp.time_out, time_out=True),
++    "motion_end": TerminationTermCfg(func=_motion_end, time_out=True),
+     "anchor_pos": TerminationTermCfg(
+       func=mdp.bad_anchor_pos_z_only,
+       params={"command_name": "motion", "threshold": 0.25},
+diff --git a/src/mjlab/utils/torch.py b/src/mjlab/utils/torch.py
+index 4275bf4..b27a30b 100644
+--- a/src/mjlab/utils/torch.py
++++ b/src/mjlab/utils/torch.py
+@@ -18,10 +18,10 @@ def configure_torch_backends(allow_tf32: bool = True, deterministic: bool = Fals
+     See https://pytorch.org/docs/stable/notes/cuda.html#tf32-on-ampere for details.
+   """
+   torch_version = parse(torch.__version__.split("+")[0])  # Handle e.g., "2.9.0+cu118".
+-  if torch_version >= parse("2.9.0"):
+-    _configure_29(allow_tf32)
+-  else:
+-    _configure_pre29(allow_tf32)
++  # Torch 2.10 Inductor pad_mm still reads the legacy allow_tf32 property.
++  # Setting the new fp32_precision API and then reading legacy raises an error.
++  # Use only the legacy settings in this isolated SuperMimic compatibility build.
++  _configure_pre29(allow_tf32)
+ 
+   torch.backends.cudnn.benchmark = not deterministic  # Find fastest algorithms.
+   torch.backends.cudnn.deterministic = deterministic  # Ensure reproducibility.
+diff --git a/src/mjlab/utils/forward_kinematics.py b/src/mjlab/utils/forward_kinematics.py
+new file mode 100644
+--- /dev/null
++++ b/src/mjlab/utils/forward_kinematics.py
+@@ -0,0 +1,35 @@
++"""Single-G1 differentiable FK compatibility interface for official SuperMimic.
++
++Wraps the locally validated torch G1Kinematics implementation and maps MuJoCo
++free-joint angular velocity (body frame) from the world-frame API.
++For the isolated public mjlab v1.5.0 fallback only.
++"""
++from __future__ import annotations
++
++from pathlib import Path
++import mujoco
++import torch
++from mjlab.utils.lab_api.math import quat_apply_inverse
++from mjlab.utils._supermimic_g1_fk import G1Kinematics
++
++
++class ForwardKinematics:
++  def __init__(self, model, body_indexes: torch.Tensor, device: str):
++    # The full mjlab scene includes fixed bodies before the robot root.
++    # Build from the exact G1 MJCF, with 30 motion bodies and no scene decorations.
++    g1_xml = Path(__file__).resolve().parents[1] / "asset_zoo/robots/unitree_g1/xmls/g1.xml"
++    bare_model = mujoco.MjModel.from_xml_path(str(g1_xml))
++    self.kinematics = G1Kinematics(bare_model, device=device, dtype=torch.float32)
++    if bare_model.nq != 36 or bare_model.nv != 35:
++      raise ValueError(f"Expected 29-DoF G1, got nq={bare_model.nq} nv={bare_model.nv}")
++    self.body_indexes = body_indexes
++
++  def __call__(self, root_pos, root_quat, joint_pos, root_lin_vel, root_ang_vel, joint_vel):
++    qpos = torch.cat((root_pos, root_quat, joint_pos), dim=-1)
++    qvel = torch.cat(
++      (root_lin_vel, quat_apply_inverse(root_quat, root_ang_vel), joint_vel), dim=-1
++    )
++    out = self.kinematics.forward(qpos, qvel)
++    return tuple(out[k][..., self.body_indexes, :] for k in (
++      "pos", "quat", "lin_vel", "ang_vel"
++    ))
+diff --git a/src/mjlab/utils/_supermimic_g1_fk.py b/src/mjlab/utils/_supermimic_g1_fk.py
+new file mode 100644
+--- /dev/null
++++ b/src/mjlab/utils/_supermimic_g1_fk.py
+@@ -0,0 +1,167 @@
++"""Differentiable batched forward kinematics for the Unitree G1 (torch).
++
++Built from a compiled ``mujoco.MjModel`` of ``g1.xml`` so the tree, joint axes,
++anchors and ``qpos0`` are exactly MuJoCo's. Reproduces, for every body:
++
++* ``xpos`` / ``xquat``                      (link frame origin pose, world)
++* link-frame-origin linear velocity, world  (== mjlab ``body_link_lin_vel_w``)
++* angular velocity, world                   (== mjlab ``body_link_ang_vel_w``)
++
++given ``qpos`` (36: root pos, root quat wxyz, 29 hinges) and ``qvel`` (35: root
++linear velocity in world, root angular velocity in **body** frame, 29 hinge rates),
++i.e. MuJoCo's free-joint conventions.
++
++Quaternion math is element-wise (no 3x3 matmuls) so results are unaffected by TF32.
++Position FK follows ``mj_kinematics`` (hinge rotates about its anchor by
++``qpos - qpos0``); velocities are propagated down the tree:
++
++    w_b = w_parent + axis_w * qdot
++    v_b = v_parent + w_parent x (p_b - p_parent) + (axis_w * qdot) x (p_b - anchor_w)
++
++which equals MuJoCo's ``cvel`` transported to the body origin (``mj_objectVelocity``
++with ``flg_local=0``).
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++import mujoco
++import numpy as np
++import torch
++
++from mjlab.utils._supermimic_rotations import quat_apply, quat_from_angle_axis, quat_mul, quat_normalize
++
++
++@dataclass
++class _BodyLink:
++    body_id: int  # MuJoCo body id (1..nbody-1)
++    parent_index: int  # index into our body list (0..nb-1), -1 for the root
++    joint_type: int  # mjJNT_FREE / mjJNT_HINGE / -1 (fixed)
++    qpos_adr: int
++    dof_adr: int
++
++
++class G1Kinematics:
++    """Batched differentiable FK for a MuJoCo single-tree humanoid (G1)."""
++
++    def __init__(
++        self,
++        model: mujoco.MjModel,
++        device: str | torch.device = "cpu",
++        dtype: torch.dtype = torch.float32,
++    ):
++        self.device = torch.device(device)
++        self.dtype = dtype
++        self.nbody = model.nbody - 1  # exclude world
++        self.nq = model.nq
++        self.nv = model.nv
++        self.body_names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i) for i in range(1, model.nbody)]
++        self.joint_names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i) for i in range(model.njnt)]
++
++        links: list[_BodyLink] = []
++        for b in range(1, model.nbody):
++            parent = int(model.body_parentid[b])
++            parent_index = -1 if parent == 0 else parent - 1
++            assert parent < b, "MuJoCo bodies are topologically ordered"
++            njnt = int(model.body_jntnum[b])
++            if njnt == 0:
++                links.append(_BodyLink(b, parent_index, -1, -1, -1))
++                continue
++            assert njnt == 1, f"body {b} has {njnt} joints; only 0/1 supported"
++            j = int(model.body_jntadr[b])
++            jt = int(model.jnt_type[j])
++            assert jt in (mujoco.mjtJoint.mjJNT_FREE, mujoco.mjtJoint.mjJNT_HINGE), f"joint type {jt}"
++            links.append(_BodyLink(b, parent_index, jt, int(model.jnt_qposadr[j]), int(model.jnt_dofadr[j])))
++        assert links[0].joint_type == mujoco.mjtJoint.mjJNT_FREE and links[0].parent_index == -1
++        self.links = links
++
++        t = lambda a: torch.as_tensor(np.asarray(a), dtype=dtype, device=self.device)  # noqa: E731
++        self.body_pos = t(model.body_pos[1:])  # (nb,3)
++        self.body_quat = t(model.body_quat[1:])  # (nb,4) wxyz
++        jnt_pos = np.zeros((self.nbody, 3))
++        jnt_axis = np.zeros((self.nbody, 3))
++        qpos0 = np.zeros(self.nbody)
++        for i, l in enumerate(links):
++            if l.joint_type == mujoco.mjtJoint.mjJNT_HINGE:
++                j = int(model.body_jntadr[l.body_id])
++                jnt_pos[i] = model.jnt_pos[j]
++                jnt_axis[i] = model.jnt_axis[j]
++                qpos0[i] = model.qpos0[l.qpos_adr]
++        self.jnt_pos = t(jnt_pos)
++        self.jnt_axis = t(jnt_axis)
++        self.qpos0 = t(qpos0)
++        # Hinge bookkeeping in body order (skip root / fixed bodies).
++        self.hinge_body_idx = [i for i, l in enumerate(links) if l.joint_type == mujoco.mjtJoint.mjJNT_HINGE]
++        self.hinge_qpos_adr = torch.tensor([links[i].qpos_adr for i in self.hinge_body_idx], device=self.device)
++        self.hinge_dof_adr = torch.tensor([links[i].dof_adr for i in self.hinge_body_idx], device=self.device)
++
++    def body_index(self, name: str) -> int:
++        return self.body_names.index(name)
++
++    def body_indices(self, names) -> torch.Tensor:
++        return torch.tensor([self.body_names.index(n) for n in names], device=self.device)
++
++    # ------------------------------------------------------------------ core
++
++    def forward(self, qpos: torch.Tensor, qvel: torch.Tensor | None = None):
++        """FK for a batch.
++
++        Args:
++          qpos: (..., nq) MuJoCo generalized positions.
++          qvel: (..., nv) MuJoCo generalized velocities (free joint: lin world, ang body).
++        Returns:
++          dict with 'pos' (..., nb, 3), 'quat' (..., nb, 4) and, if qvel is given,
++          'lin_vel' (..., nb, 3), 'ang_vel' (..., nb, 3) in world frame at the link origin.
++        """
++        batch = qpos.shape[:-1]
++        nb = self.nbody
++        pos = [None] * nb
++        quat = [None] * nb
++        lin = [None] * nb
++        ang = [None] * nb
++        compute_vel = qvel is not None
++
++        # Root (free joint).
++        root_pos = qpos[..., 0:3]
++        root_quat = quat_normalize(qpos[..., 3:7])
++        pos[0] = root_pos
++        quat[0] = root_quat
++        if compute_vel:
++            lin[0] = qvel[..., 0:3]
++            ang[0] = quat_apply(root_quat, qvel[..., 3:6])  # body -> world
++
++        for i in range(1, nb):
++            l = self.links[i]
++            p = l.parent_index
++            pq = quat[p]
++            pp = pos[p]
++            # Body frame from parent frame (fixed offset).
++            b_pos = pp + quat_apply(pq, self.body_pos[i].expand(*batch, 3))
++            b_quat = quat_mul(pq, self.body_quat[i].expand(*batch, 4))
++            if l.joint_type == mujoco.mjtJoint.mjJNT_HINGE:
++                anchor = b_pos + quat_apply(b_quat, self.jnt_pos[i].expand(*batch, 3))
++                axis_w = quat_apply(b_quat, self.jnt_axis[i].expand(*batch, 3))
++                angle = qpos[..., l.qpos_adr] - self.qpos0[i]
++                q_loc = quat_from_angle_axis(angle, self.jnt_axis[i].expand(*batch, 3))
++                b_quat = quat_mul(b_quat, q_loc)
++                b_pos = anchor - quat_apply(b_quat, self.jnt_pos[i].expand(*batch, 3))
++                if compute_vel:
++                    qd = qvel[..., l.dof_adr].unsqueeze(-1)
++                    w_joint = axis_w * qd
++                    ang[i] = ang[p] + w_joint
++                    lin[i] = lin[p] + torch.cross(ang[p], b_pos - pp, dim=-1) + torch.cross(w_joint, b_pos - anchor, dim=-1)
++            else:  # fixed body
++                if compute_vel:
++                    ang[i] = ang[p]
++                    lin[i] = lin[p] + torch.cross(ang[p], b_pos - pp, dim=-1)
++            pos[i] = b_pos
++            quat[i] = b_quat
++
++        out = {"pos": torch.stack(pos, dim=-2), "quat": torch.stack(quat, dim=-2)}
++        if compute_vel:
++            out["lin_vel"] = torch.stack(lin, dim=-2)
++            out["ang_vel"] = torch.stack(ang, dim=-2)
++        return out
++
++    __call__ = forward
+diff --git a/src/mjlab/utils/_supermimic_rotations.py b/src/mjlab/utils/_supermimic_rotations.py
+new file mode 100644
+--- /dev/null
++++ b/src/mjlab/utils/_supermimic_rotations.py
+@@ -0,0 +1,106 @@
++"""Rotation helpers (torch, batched, quaternions in **wxyz**).
++
++Re-exports mjlab's `lab_api.math` primitives so the whole project shares one
++convention with the environment's reward and command code, and adds the few
++operations the world model needs: rotation-vector exp/log, 6D rotation
++representation and heading (yaw) frames.
++
++All functions are differentiable and work on arbitrary leading batch dims.
++"""
++
++from __future__ import annotations
++
++import math
++
++import torch
++from mjlab.utils.lab_api.math import (  # noqa: F401  (re-exported)
++    matrix_from_quat,
++    quat_apply,
++    quat_apply_inverse,
++    quat_conjugate,
++    quat_error_magnitude,
++    quat_from_angle_axis,
++    quat_inv,
++    quat_mul,
++    yaw_quat,
++)
++
++_EPS = 1.0e-8
++
++
++def quat_normalize(q: torch.Tensor) -> torch.Tensor:
++    return q / q.norm(dim=-1, keepdim=True).clamp_min(_EPS)
++
++
++def quat_canonical(q: torch.Tensor) -> torch.Tensor:
++    """Flip sign so that w >= 0 (removes the double cover ambiguity)."""
++    return torch.where(q[..., :1] < 0, -q, q)
++
++
++def quat_from_rotvec(v: torch.Tensor) -> torch.Tensor:
++    """Exponential map: rotation vector (angle * axis) -> unit quaternion (wxyz).
++
++    Uses a Taylor expansion of sin(a/2)/a near zero so gradients stay finite at v = 0.
++    """
++    angle_sq = (v * v).sum(-1, keepdim=True)
++    angle = torch.sqrt(angle_sq.clamp_min(1e-30))
++    half = 0.5 * angle
++    small = angle < 1e-4
++    # sin(half)/angle with series fallback: 1/2 - angle^2/48
++    k = torch.where(small, 0.5 - angle_sq / 48.0, torch.sin(half) / angle)
++    w = torch.where(small, 1.0 - angle_sq / 8.0, torch.cos(half))
++    return torch.cat([w, v * k], dim=-1)
++
++
++def rotvec_from_quat(q: torch.Tensor) -> torch.Tensor:
++    """Logarithmic map: unit quaternion (wxyz) -> rotation vector in (-pi, pi]."""
++    q = quat_canonical(q)
++    w = q[..., :1]
++    xyz = q[..., 1:]
++    s = xyz.norm(dim=-1, keepdim=True)
++    angle = 2.0 * torch.atan2(s, w)
++    small = s < 1e-6
++    # angle / sin(angle/2) == angle / s ; series: 2 + angle^2/12 ... (with s ~ angle/2)
++    k = torch.where(small, 2.0 + (angle * angle) / 12.0, angle / torch.where(small, torch.ones_like(s), s))
++    return xyz * k
++
++
++def quat_integrate(q: torch.Tensor, dtheta_body: torch.Tensor) -> torch.Tensor:
++    """Apply a body-frame rotation increment: q ⊗ exp(dtheta)."""
++    return quat_normalize(quat_mul(q, quat_from_rotvec(dtheta_body)))
++
++
++def rot6d_from_quat(q: torch.Tensor) -> torch.Tensor:
++    """First two columns of the rotation matrix, flattened (..., 6)."""
++    m = matrix_from_quat(q)
++    return m[..., :, :2].reshape(*q.shape[:-1], 6)
++
++
++def heading_yaw(q: torch.Tensor) -> torch.Tensor:
++    """Yaw angle of the heading frame of q (rotation of the body x-axis about world z)."""
++    w, x, y, z = q.unbind(-1)
++    siny_cosp = 2.0 * (w * z + x * y)
++    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
++    return torch.atan2(siny_cosp, cosy_cosp)
++
++
++def quat_from_yaw(yaw: torch.Tensor) -> torch.Tensor:
++    half = 0.5 * yaw
++    zeros = torch.zeros_like(half)
++    return torch.stack([torch.cos(half), zeros, zeros, torch.sin(half)], dim=-1)
++
++
++def heading_quat(q: torch.Tensor) -> torch.Tensor:
++    """Unit quaternion of the pure-yaw heading frame (same as mjlab yaw_quat, but via atan2)."""
++    return quat_from_yaw(heading_yaw(q))
++
++
++def wrap_to_pi(a: torch.Tensor) -> torch.Tensor:
++    return (a + math.pi) % (2.0 * math.pi) - math.pi
++
++
++def projected_gravity(q_body_w: torch.Tensor) -> torch.Tensor:
++    """Gravity direction (0,0,-1) expressed in the body frame."""
++    g = torch.tensor([0.0, 0.0, -1.0], dtype=q_body_w.dtype, device=q_body_w.device)
++    g = g.expand(*q_body_w.shape[:-1], 3)
++    return quat_apply_inverse(q_body_w, g)

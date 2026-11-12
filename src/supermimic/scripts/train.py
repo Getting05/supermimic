@@ -11,6 +11,7 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.tasks.registry import list_tasks, load_env_cfg
 
 import supermimic.tasks  # noqa: F401
+from supermimic.envs.motion_command import configure_motion_command
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
 from supermimic.scripts.train_utils import (
   create_env,
@@ -33,9 +34,16 @@ class TrainConfig:
   @staticmethod
   def from_task(task_id: str) -> "TrainConfig":
     env_cfg = load_env_cfg(task_id, play=False)
+    runner_cfg = SuperMimicRunnerCfg()
+    if task_id.endswith("-P2"):
+      runner_cfg.actor_obs = "proprio"
+      runner_cfg.history_length = 10
     return TrainConfig(
       env=env_cfg,
-      runner=SuperMimicRunnerCfg(),
+      runner=runner_cfg,
+      registry_name=None
+      if task_id.endswith("-P2")
+      else "supermimic/wandb-registry-motions/lafan_run1_subject5",
     )
 
 
@@ -69,6 +77,10 @@ def main() -> None:
     args.registry_name = None  # avoid linking a stale registry artifact for lineage
     print(f"[INFO] Using local motion file: {args.motion_file}")
   else:
+    if chosen_task.endswith("-P2") and not args.registry_name:
+      raise ValueError(
+        "P2 requires --motion-file with P2 motion NPZ data or a P2 --registry-name"
+      )
     motion_file = download_registry_motions(args.registry_name)
     if motion_file is not None:
       args.env.commands["motion"].motion_file = motion_file
@@ -79,8 +91,12 @@ def main() -> None:
     print("[INFO] Auto-detected maxcoord representation from task_id")
 
   args.env.commands["motion"].sampling_mode = (
-    "external" if args.runner.sampling_mode == "return" else args.runner.sampling_mode
+    "external"
+    if args.runner.sampling_mode in ("return", "sgs")
+    else args.runner.sampling_mode
   )
+  if args.runner.sampling_mode == "sgs":
+    configure_motion_command(args.env, sgs=args.runner.sgs)
 
   env = create_env(args.env, args.num_envs, device)
 

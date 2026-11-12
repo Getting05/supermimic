@@ -73,8 +73,8 @@ class _SingleEncoderOnnx(nn.Module):
   """Single-task slice of the multi-encoder actor: ``cat([history, goal]) → action``.
 
   Bakes the chosen encoder + shared decoder + the matching normalizers into
-  one ONNX-compatible module. The deploy-time latent (``tanh(enc_out)``) is
-  applied here rather than read from the actor's forward
+  one ONNX-compatible module. The actor's continuous or FSQ bottleneck is
+  reused here rather than reading the actor's forward
   to keep the graph closed and free of training-only branches.
 
   The obs part of the input is the TERM-MAJOR ``history_length``-frame stack —
@@ -90,6 +90,7 @@ class _SingleEncoderOnnx(nn.Module):
     self.obs_normalizer = actor.obs_normalizer
     self.goal_normalizer = actor.goal_normalizers[task_name]
     self.encoder = actor.encoders[task_name]
+    self.bottleneck = actor.bottleneck
     self.decoder = actor.decoder
     self.history_length = actor.history_length
     self.hist_size = actor.history_length * actor.obs_dim
@@ -103,7 +104,7 @@ class _SingleEncoderOnnx(nn.Module):
     )
     goal = x[..., self.hist_size :]
     history_n = self.obs_normalizer(history)
-    z = torch.tanh(self.encoder(self.goal_normalizer(goal)))
+    z = self.bottleneck(self.encoder(self.goal_normalizer(goal)))
     return self.decoder(torch.cat([z, history_n.flatten(start_dim=1)], dim=-1))
 
 
